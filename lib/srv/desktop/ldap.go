@@ -17,10 +17,9 @@ limitations under the License.
 package desktop
 
 import (
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/go-ldap/ldap/v3"
 	"github.com/gravitational/trace"
@@ -28,53 +27,29 @@ import (
 
 // Note: if you want to browse LDAP on the Windows machine, run ADSIEdit.msc.
 type ldapClient struct {
-	cfg    LDAPConfig
+	cfg LDAPConfig
+
+	mu     sync.Mutex
 	client ldap.Client
 }
 
-// newLDAPClient connects to an LDAP server, authenticates and returns the
-// client connection. Caller must close the client after using it.
-func newLDAPClient(cfg LDAPConfig) (*ldapClient, error) {
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: cfg.InsecureSkipVerify,
-	}
+func (c *ldapClient) setClient(client ldap.Client) {
+	c.mu.Lock()
+	c.client.Close()
+	c.client = client
+	c.mu.Unlock()
+}
 
-	if !cfg.InsecureSkipVerify {
-		// Get the SystemCertPool, continue with an empty pool on error
-		rootCAs, _ := x509.SystemCertPool()
-		if rootCAs == nil {
-			rootCAs = x509.NewCertPool()
-		}
-
-		if cfg.CA != nil {
-			// Append our cert to the pool.
-			rootCAs.AddCert(cfg.CA)
-		}
-
-		// Supply our cert pool to TLS config for verification.
-		tlsConfig.RootCAs = rootCAs
-	}
-
-	con, err := ldap.DialURL("ldaps://"+cfg.Addr, ldap.DialWithTLSConfig(tlsConfig))
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// TODO(zmb3): Active Directory, theoretically, supports cert-based
-	// authentication. Figure out the right certificate format and generate it
-	// with Teleport CA for authn here.
-	if err := con.Bind(cfg.Username, cfg.Password); err != nil {
-		con.Close()
-		return nil, trace.Wrap(err)
-	}
-	return &ldapClient{
-		cfg:    cfg,
-		client: con,
-	}, nil
+func (c *ldapClient) c() ldap.Client {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.client
 }
 
 func (c *ldapClient) close() {
+	c.mu.Lock()
 	c.client.Close()
+	c.mu.Unlock()
 }
 
 // readWithFilter searches the specified DN (and its children) using the specified LDAP filter.
@@ -91,7 +66,7 @@ func (c *ldapClient) readWithFilter(dn string, filter string, attrs []string) ([
 		attrs,
 		nil, // no Controls
 	)
-	res, err := c.client.Search(req)
+	res, err := c.c().Search(req)
 	if err != nil {
 		return nil, trace.Wrap(err, "fetching LDAP object %q: %v", dn, err)
 	}
@@ -126,7 +101,7 @@ func (c *ldapClient) create(dn string, class string, attrs map[string][]string) 
 	}
 	req.Attribute("objectClass", []string{class})
 
-	if err := c.client.Add(req); err != nil {
+	if err := c.c().Add(req); err != nil {
 		if ldapErr, ok := err.(*ldap.Error); ok {
 			switch ldapErr.ResultCode {
 			case ldap.LDAPResultEntryAlreadyExists:
@@ -166,7 +141,7 @@ func (c *ldapClient) update(dn string, replaceAttrs map[string][]string) error {
 	for k, v := range replaceAttrs {
 		req.Replace(k, v)
 	}
-	if err := c.client.Modify(req); err != nil {
+	if err := c.c().Modify(req); err != nil {
 		return trace.Wrap(err, "updating %q: %v", dn, err)
 	}
 	return nil
